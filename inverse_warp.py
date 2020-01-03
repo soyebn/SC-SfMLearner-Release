@@ -4,6 +4,8 @@ import torch.nn.functional as F
 
 pixel_coords = None
 
+#how much magnification by fish2rect is needed 
+scale_rect_by_fish = 3.0
 
 def set_id_grid(depth):
     global pixel_coords
@@ -25,8 +27,48 @@ def check_sizes(input, input_name, expected):
     assert(all(condition)), "wrong size for {}, expected {}, got  {}".format(
         input_name, 'x'.join(expected), list(input.size()))
 
+#Convert fisheye pixel co-ordinates to recti-linear co-ordinates
+def proc_f2r(current_pixel_coords = [], w = 0, h = 0, batch_size = 0, num_lines_crop = 0, en_fisheye = False, 
+  intrinsics = [], en_print = False):
 
-def pixel2cam(depth, intrinsics_inv):
+    if not en_fisheye:
+        return current_pixel_coords
+
+    cx_f = intrinsics[0,2] 
+    cy_f = intrinsics[1,2] 
+    
+    w_r = w
+    h_r = h
+
+    cx_r = intrinsics[0,2] 
+    cy_r = intrinsics[1,2] 
+
+    dx_f = current_pixel_coords[:,0,:] - cx_f
+    dy_f = current_pixel_coords[:,1,:] - cy_f
+
+    #convert dx_f, dy_f from n/w res to origin res so that f2r can work
+    #also if there are few lines cropped before resizing, need to take care
+    #1280x720 -> 1280x(720-n) -> wxh
+    dx_f = dx_f * 1280.0 / w
+    dy_f = dy_f * (720.0-num_lines_crop) / h
+
+    [dx_r, dy_r]  = delta_f_to_delta_r(dx_f = dx_f, dy_f = dy_f, r_fish_to_theta_rect = r_fish_to_theta_rect)  
+    
+    #convert back frm orig res to n/w ip res
+    #also scale down dx_r dy_r so that it can be represented in about same size as original fisheye 
+    dx_r = dx_r * w / (1280.0 * scale_rect_by_fish)
+    dy_r = dy_r * h / ((720.0-num_lines_crop) * scale_rect_by_fish)
+
+    x_r = torch.clamp(dx_r + cx_r, 0, w_r-1)
+    y_r = torch.clamp(dy_r + cy_r, 0, h_r-1)
+    
+    for img_idx in range(batch_size):
+        current_pixel_coords[img_idx,0,:] = x_r[img_idx,:]
+        current_pixel_coords[img_idx,1,:] = y_r[img_idx,:]
+
+    return current_pixel_coords
+    
+def pixel2cam(depth, intrinsics_inv, num_lines_crop = 0, fisheye=False):
     global pixel_coords
     """Transform coordinates in the pixel frame to the camera frame.
     Args:
@@ -40,6 +82,10 @@ def pixel2cam(depth, intrinsics_inv):
         set_id_grid(depth)
     current_pixel_coords = pixel_coords[:, :, :h, :w].expand(
         b, 3, h, w).reshape(b, 3, -1)  # [B, 3, H*W]
+    
+    current_pixel_coords = proc_f2r(current_pixel_coords = current_pixel_coords, w = w, h = h, batch_size = b,
+      en_fisheye = fisheye, intrinsics = intrinsics_inv.inverse()[0], num_lines_crop = num_lines_crop, en_print = False)
+              
     cam_coords = (intrinsics_inv @ current_pixel_coords).reshape(b, 3, h, w)
     return cam_coords * depth.unsqueeze(1)
 
@@ -190,8 +236,40 @@ def inverse_warp(img, depth, pose, intrinsics, rotation_mode='euler', padding_mo
 
     return projected_img, valid_points
 
+#Convert recti-linear pixel co-ordinates to fisheye co-ordinates
+def proc_r2f(X = [], Y = [], Z = [], w = 0, h = 0, intrinsics = [], num_lines_crop = 0, en_print = False):
+    
+    w_r = w
+    h_r = h
 
-def cam2pixel2(cam_coords, proj_c2p_rot, proj_c2p_tr, padding_mode):
+    cx_r = intrinsics[0,2] 
+    cy_r = intrinsics[1,2] 
+
+    cx_f = intrinsics[0,2] 
+    cy_f = intrinsics[1,2] 
+
+    dX_r = (X / Z) - cx_r
+    dY_r = (Y / Z) - cy_r
+
+    #convert dx_r, dy_r from n/w res to origin res so that r2f can work
+    #832x256 ->  1280x360 
+    dX_r = dX_r * (1280.0 * scale_rect_by_fish )/ w 
+    dY_r = dY_r * ((720.0-num_lines_crop) * scale_rect_by_fish) / h
+    
+    #rect to fish conversion
+    # make X [0 to 1280) and Y [0 to 720) before doing r2f conversion
+    [dX_f, dY_f] = delta_r_to_delta_f(dX_rect = dX_r, dY_rect = dY_r)
+
+    #convert back frm orig res(1280x720) to n/w ip res
+    dX_f = dX_f * w / 1280.0 
+    dY_f = dY_f * h / (720.0-num_lines_crop)
+
+    X_f = dX_f + cx_f
+    Y_f = dY_f + cy_f
+    
+    return [X_f, Y_f]
+
+def cam2pixel2(cam_coords, proj_c2p_rot, proj_c2p_tr, padding_mode, intrinsics = [], num_lines_crop = 0, fisheye = False):
     """Transform coordinates in the camera frame to the pixel frame.
     Args:
         cam_coords: pixel coordinates defined in the first camera coordinates system -- [B, 4, H, W]
@@ -212,10 +290,18 @@ def cam2pixel2(cam_coords, proj_c2p_rot, proj_c2p_tr, padding_mode):
     X = pcoords[:, 0]
     Y = pcoords[:, 1]
     Z = pcoords[:, 2].clamp(min=1e-3)
+    
+    if fisheye:
+        [X_f, Y_f] = proc_r2f(X = X, Y = Y, Z = Z, w = w, h = h, intrinsics = intrinsics, num_lines_crop = num_lines_crop,
+         en_print = False)
+        X_norm = 2*(X_f)/(w-1) - 1
+        Y_norm = 2*(Y_f)/(h-1) - 1
+    else:
+        # Normalized, -1 if on extreme left, 1 if on extreme right (x = w-1) [B, H*W]
+        X_norm = 2*(X / Z)/(w-1) - 1
+        Y_norm = 2*(Y / Z)/(h-1) - 1  # Idem [B, H*W]
+      
 
-    # Normalized, -1 if on extreme left, 1 if on extreme right (x = w-1) [B, H*W]
-    X_norm = 2*(X / Z)/(w-1) - 1
-    Y_norm = 2*(Y / Z)/(h-1) - 1  # Idem [B, H*W]
     if padding_mode == 'zeros':
         X_mask = ((X_norm > 1)+(X_norm < -1)).detach()
         # make sure that no point in warped image is a combinaison of im and gray
@@ -227,7 +313,7 @@ def cam2pixel2(cam_coords, proj_c2p_rot, proj_c2p_tr, padding_mode):
     return pixel_coords.reshape(b, h, w, 2), Z.reshape(b, 1, h, w)
 
 
-def inverse_warp2(img, depth, ref_depth, pose, intrinsics, padding_mode='zeros'):
+def inverse_warp2(img, depth, ref_depth, pose, intrinsics, padding_mode='zeros', num_lines_crop = 0, en_fisheye = False):
     """
     Inverse warp a source image to the target image plane.
     Args:
@@ -247,17 +333,18 @@ def inverse_warp2(img, depth, ref_depth, pose, intrinsics, padding_mode='zeros')
     check_sizes(intrinsics, 'intrinsics', 'B33')
 
     batch_size, _, img_height, img_width = img.size()
-
-    cam_coords = pixel2cam(depth.squeeze(1), intrinsics.inverse())  # [B,3,H,W]
+    
+    cam_coords = pixel2cam(depth.squeeze(1), intrinsics.inverse(), num_lines_crop = num_lines_crop, fisheye = en_fisheye)  # [B,3,H,W]
 
     pose_mat = pose_vec2mat(pose)  # [B,3,4]
 
     # Get projection matrix for tgt camera frame to source pixel frame
     proj_cam_to_src_pixel = intrinsics @ pose_mat  # [B, 3, 4]
-
+    
     rot, tr = proj_cam_to_src_pixel[:, :, :3], proj_cam_to_src_pixel[:, :, -1:]
     src_pixel_coords, computed_depth = cam2pixel2(
-        cam_coords, rot, tr, padding_mode)  # [B,H,W,2]
+        cam_coords, rot, tr, padding_mode, intrinsics = intrinsics[0], num_lines_crop = num_lines_crop,
+         fisheye = en_fisheye)  # [B,H,W,2]
     projected_img = F.grid_sample(
         img, src_pixel_coords, padding_mode=padding_mode)
 
